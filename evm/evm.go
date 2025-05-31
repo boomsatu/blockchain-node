@@ -1,94 +1,74 @@
-package evm
+package evm // Diperbaiki: package evm
 
 import (
 	"blockchain-node/interfaces"
-	"blockchain-node/logger" // BARU: Impor logger
+	"blockchain-node/logger"
+
+	// customState "blockchain-node/state" // Tidak perlu di sini jika ExecutionResult.Logs diisi dari StateAdapter
 	"errors"
-	"math/big"
+	"math/big" // Masih dibutuhkan untuk konversi ke/dari uint256
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/vm"
-	// "github.com/ethereum/go-ethereum/params" // Tidak dibutuhkan secara langsung di sini, didapat dari interfaces.ChainConfigItf
+	"github.com/ethereum/go-ethereum/core/vm" // Diperlukan untuk chainRules
+	"github.com/holiman/uint256"              // Untuk tipe uint256.Int
 )
 
-// Blockchain defines the interface the EVM needs to access blockchain-specific data.
-// core.Blockchain should implement this.
+// Blockchain mendefinisikan antarmuka yang dibutuhkan EVM untuk mengakses data spesifik blockchain.
 type Blockchain interface {
-	GetConfig() interfaces.ChainConfigItf                     // Returns chain configuration
-	GetBlockByNumber(number uint64) interfaces.BlockHeaderItf // Gets a block header by number
-	// GetBlockByHash is not directly used by GetHashFn, GetHashFn uses GetBlockByNumber.
-	// Jika GetHashFn diubah untuk menggunakan GetBlockByHash, maka uncomment dan implementasikan:
-	// GetBlockByHash(hash common.Hash) interfaces.BlockHeaderItf
+	GetConfig() interfaces.ChainConfigItf
+	GetBlockByNumber(number uint64) interfaces.BlockHeaderItf
 }
 
-// EVM is a wrapper around the go-ethereum EVM.
+// EVM adalah wrapper di sekitar EVM go-ethereum.
 type EVM struct {
 	blockchain Blockchain
-	vmConfig   vm.Config // vm.Config from go-ethereum
+	vmConfig   vm.Config
 }
 
-// NewEVM creates a new EVM instance.
+// NewEVM membuat instance EVM baru.
 func NewEVM(blockchain Blockchain) *EVM {
-	// vm.Config can be initialized with specific parameters if needed,
-	// e.g., Tracer, NoBaseFee, etc. For now, a default config is used.
 	config := vm.Config{
-		// Debug:     false, // Set true for debugging EVM execution
-		// Tracer:    logger.NewTracer("EVM"), // Contoh jika Anda punya EVM logger kustom
-		// NoBaseFee: true, // Set true jika chain Anda tidak menggunakan EIP-1559 BaseFee
+		// Debug: true,
+		// Tracer: logger.NewTracer("EVM_DETAIL"),
+		// NoBaseFee: true,
 	}
-
 	return &EVM{
 		blockchain: blockchain,
 		vmConfig:   config,
 	}
 }
 
-// ExecuteTransaction executes a transaction using the EVM.
-// ctx *interfaces.ExecutionContext provides all necessary context for the execution.
+// ExecuteTransaction menjalankan transaksi menggunakan EVM.
 func (e *EVM) ExecuteTransaction(ctx *interfaces.ExecutionContext) (*interfaces.ExecutionResult, error) {
-	sdb := ctx.StateDB             // Your custom state.StateDB
-	txItf := ctx.Transaction       // Your custom core.Transaction (implements interfaces.TransactionItf)
-	headerItf := ctx.BlockHeader   // Your custom core.BlockHeader (implements interfaces.BlockHeaderItf)
-	gasUsedPool := ctx.GasUsedPool // *big.Int, pointer to the block's cumulative gas used
+	sdb := ctx.StateDB
+	txItf := ctx.Transaction
+	headerItf := ctx.BlockHeader
+	gasUsedPool := ctx.GasUsedPool
 
-	// stateAdapter bridges your custom StateDB to the vm.StateDB interface required by go-ethereum's EVM.
 	stateAdapter := NewStateAdapter(sdb)
 
 	var coinbase common.Address
-	minerAddrBytes := headerItf.GetMiner() // This is [20]byte
-	if minerAddrBytes != ([20]byte{}) {    // Check if it's not a zero address
+	minerAddrBytes := headerItf.GetMiner()
+	if minerAddrBytes != ([20]byte{}) {
 		coinbase = common.BytesToAddress(minerAddrBytes[:])
 	}
 
-	// Populate BlockContext for the EVM
 	blockContext := vm.BlockContext{
-		CanTransfer: stateAdapter.CanTransfer, // Provided by StateAdapter
-		Transfer:    stateAdapter.Transfer,    // Provided by StateAdapter
-		GetHash:     e.GetHashFn(headerItf),   // Function to get historical block hashes
+		CanTransfer: stateAdapter.CanTransfer,
+		Transfer:    stateAdapter.Transfer,
+		GetHash:     e.GetHashFn(headerItf),
 		Coinbase:    coinbase,
 		BlockNumber: new(big.Int).SetUint64(headerItf.GetNumber()),
-		Time:        new(big.Int).SetInt64(headerItf.GetTimestamp()), // PERBAIKAN: Time adalah *big.Int
-		Difficulty:  new(big.Int).Set(headerItf.GetDifficulty()),     // Ensure this is a new big.Int
+		Time:        uint64(headerItf.GetTimestamp()),
+		Difficulty:  new(big.Int).Set(headerItf.GetDifficulty()),
 		GasLimit:    headerItf.GetGasLimit(),
-		BaseFee:     nil, // Set to a value if your chain supports EIP-1559
-		// Random: nil, // For PREVRANDAO, set if supporting The Merge and later forks
+		BaseFee:     nil,
 	}
 
-	txFromBytes := txItf.GetFrom() // This is [20]byte
-	txOrigin := common.BytesToAddress(txFromBytes[:])
+	chainRules := e.blockchain.GetConfig().ToEthChainConfig()
+	evmInstance := vm.NewEVM(blockContext, stateAdapter, chainRules, e.vmConfig)
 
-	// Populate TxContext for the EVM
-	txContext := vm.TxContext{
-		Origin:   txOrigin,
-		GasPrice: new(big.Int).Set(txItf.GetGasPrice()), // Ensure this is a new big.Int
-		// Value:    txItf.GetValue(), // Value is passed directly to Call/Create
-	}
-
-	// Get chain rules (e.g., EIP activation blocks) from your blockchain's config
-	chainRules := e.blockchain.GetConfig().ToEthChainConfig() // This returns *params.ChainConfig
-
-	// Create a new EVM instance for this transaction execution
-	evmInstance := vm.NewEVM(blockContext, txContext, stateAdapter, chainRules, e.vmConfig)
+	snapshotID := stateAdapter.Snapshot()
 
 	var returnData []byte
 	var vmError error
@@ -97,43 +77,86 @@ func (e *EVM) ExecuteTransaction(ctx *interfaces.ExecutionContext) (*interfaces.
 
 	txData := txItf.GetData()
 	txGasLimit := txItf.GetGasLimit()
-	txValue := txItf.GetValue()
 
-	senderRef := vm.AccountRef(txOrigin) // Sender's account reference
+	txValueUint256, overflow := uint256.FromBig(txItf.GetValue())
+	if overflow {
+		err := errors.New("transaction value overflowed uint256")
+		logger.Errorf("EVM.ExecuteTransaction: %v for tx %x", err, txItf.GetHash())
+		if gasUsedPool != nil {
+			gasUsedPool.Add(gasUsedPool, new(big.Int).SetUint64(txGasLimit))
+		}
+		stateAdapter.RevertToSnapshot(snapshotID)
+		return &interfaces.ExecutionResult{GasUsed: txGasLimit, Status: 0, Err: err, Logs: []*interfaces.Log{}}, err
+	}
+
+	txOrigin := common.Address(txItf.GetFrom())
+	callerRef := vm.AccountRef(txOrigin) // vm.AccountRef is defined in go-ethereum/core/vm
 
 	if txItf.IsContractCreation() {
-		// Execute contract creation
-		returnData, createdContractAddress, gasLeft, vmError = evmInstance.Create(senderRef, txData, txGasLimit, txValue)
+		returnData, createdContractAddress, gasLeft, vmError = evmInstance.Create(
+			callerRef,
+			txData,
+			txGasLimit,
+			txValueUint256,
+		)
 	} else {
-		// Execute message call
-		txToPtr := txItf.GetTo() // This is *[20]byte
+		txToPtr := txItf.GetTo()
 		if txToPtr == nil {
-			// This should ideally be caught by transaction validation before reaching here
 			err := errors.New("transaction 'to' address is nil for non-contract creation")
-			if gasUsedPool != nil { // Update gas pool even on this type of error
+			if gasUsedPool != nil {
 				gasUsedPool.Add(gasUsedPool, new(big.Int).SetUint64(txGasLimit))
 			}
-			return &interfaces.ExecutionResult{GasUsed: txGasLimit, Status: 0, Err: err}, err
+			stateAdapter.RevertToSnapshot(snapshotID)
+			return &interfaces.ExecutionResult{GasUsed: txGasLimit, Status: 0, Err: err, Logs: []*interfaces.Log{}}, err
 		}
-		toAddrBytes := *txToPtr // Dereference to [20]byte
-		toAddr := common.BytesToAddress(toAddrBytes[:])
-		returnData, gasLeft, vmError = evmInstance.Call(senderRef, toAddr, txData, txGasLimit, txValue)
+		toAddr := common.BytesToAddress((*txToPtr)[:])
+		returnData, gasLeft, vmError = evmInstance.Call(
+			callerRef,
+			toAddr,
+			txData,
+			txGasLimit,
+			txValueUint256,
+		)
 	}
 
-	// Prepare the execution result
-	executionResult := &interfaces.ExecutionResult{
-		Status:     1, // Assume success initially
-		ReturnData: returnData,
-		Logs:       []interfaces.Log{}, // Logs will be populated by core.Blockchain from stateDB
-	}
 	actualGasUsed := txGasLimit - gasLeft
+	finalLogs := []*interfaces.Log{}
 
 	if vmError != nil {
-		executionResult.Status = 0 // Mark as failed
-		executionResult.Err = vmError
-		logger.Warningf("EVM execution error for tx %x: %v. Gas used: %d", txItf.GetHash(), vmError, actualGasUsed)
+		logger.Warningf("EVM execution error for tx %x: %v. Gas used: %d. Reverting to snapshot %d.", txItf.GetHash(), vmError, actualGasUsed, snapshotID)
+		stateAdapter.RevertToSnapshot(snapshotID)
+	} else {
+		sdbLogs := sdb.GetLogs(txItf.GetHash())
+		for _, sdbLog := range sdbLogs {
+			topics := make([]common.Hash, len(sdbLog.Topics))
+			for i, t := range sdbLog.Topics {
+				topics[i] = common.BytesToHash(t[:])
+			}
+			finalLogs = append(finalLogs, &interfaces.Log{
+				Address:     common.BytesToAddress(sdbLog.Address[:]),
+				Topics:      topics,
+				Data:        sdbLog.Data,
+				BlockNumber: sdbLog.BlockNumber,
+				TxHash:      common.BytesToHash(sdbLog.TxHash[:]),
+				TxIndex:     uint(sdbLog.TxIndex),
+				BlockHash:   common.BytesToHash(sdbLog.BlockHash[:]),
+				Index:       uint(sdbLog.Index),
+			})
+		}
+		logger.Debugf("EVM execution successful for tx %x. Gas used: %d. Logs retrieved: %d", txItf.GetHash(), actualGasUsed, len(finalLogs))
 	}
-	executionResult.GasUsed = actualGasUsed
+
+	executionResult := &interfaces.ExecutionResult{
+		GasUsed:    actualGasUsed,
+		Status:     1,
+		ReturnData: returnData,
+		Logs:       finalLogs,
+		Err:        vmError,
+	}
+
+	if vmError != nil {
+		executionResult.Status = 0
+	}
 
 	if txItf.IsContractCreation() && executionResult.Status == 1 {
 		if createdContractAddress != (common.Address{}) {
@@ -141,41 +164,29 @@ func (e *EVM) ExecuteTransaction(ctx *interfaces.ExecutionContext) (*interfaces.
 			copy(contractAddrBytes[:], createdContractAddress.Bytes())
 			executionResult.ContractAddress = &contractAddrBytes
 		} else {
-			// It's possible for Create to succeed but return an empty address if the init code is empty or only returns.
-			// This is not necessarily an error that should revert the state, but good to log.
-			logger.Debugf("Contract creation for tx %x resulted in empty contract address (this might be intended if init code is empty).", txItf.GetHash())
+			logger.Debugf("Contract creation for tx %x resulted in empty contract address.", txItf.GetHash())
 		}
 	}
 
-	// Update the block's cumulative gas used pool
 	if gasUsedPool != nil {
 		gasUsedPool.Add(gasUsedPool, new(big.Int).SetUint64(actualGasUsed))
 	}
 
-	return executionResult, executionResult.Err // Return VmError as the primary error status
+	return executionResult, vmError
 }
 
-// GetHashFn provides the GetHash function for the EVM's BlockContext.
-// It allows the EVM to query for historical block hashes.
 func (e *EVM) GetHashFn(currentProcessingHeader interfaces.BlockHeaderItf) vm.GetHashFunc {
 	return func(blockNumToQuery uint64) common.Hash {
-		// The EVM requests hashes of *previous* blocks relative to the block being processed.
-		// blockNumToQuery is the block number for which the hash is requested.
-		// currentProcessingHeader.GetNumber() is the number of the block currently being processed.
 		if blockNumToQuery >= currentProcessingHeader.GetNumber() {
-			// Requesting hash of current or future block relative to the one being processed.
-			// Standard GetHashFn behavior is to return empty hash for such cases.
 			return common.Hash{}
 		}
-
-		// Fetch the header for the requested block number.
-		// e.blockchain is the Blockchain interface passed to NewEVM.
 		headerItf := e.blockchain.GetBlockByNumber(blockNumToQuery)
 		if headerItf != nil {
-			hashBytes := headerItf.GetHash() // This is [32]byte
+			hashBytes := headerItf.GetHash()
 			return common.BytesToHash(hashBytes[:])
 		}
-		// Return empty hash if the block is not found (e.g., too old or chain reorged).
 		return common.Hash{}
 	}
 }
+
+var _ interfaces.VirtualMachine = (*EVM)(nil)

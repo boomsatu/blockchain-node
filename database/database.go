@@ -1,375 +1,540 @@
 package database
 
 import (
+	"bytes" // Ditambahkan untuk bytes.Compare
 	"errors"
-	"strings"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
 
-	"github.com/ethereum/go-ethereum/ethdb" // PASTIKAN package ini ter-resolve dengan benar
-	// oleh Go environment Anda dan versinya (misalnya v1.15.11)
-	// mengekspor ErrNotFound, Snapshot, dan CompactionHook.
 	"github.com/syndtr/goleveldb/leveldb"
-	ldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
-	"github.com/syndtr/goleveldb/leveldb/filter"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
-	"github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/syndtr/goleveldb/leveldb/util" // Masih dibutuhkan untuk util.Range
 )
 
-// Interface Database mendefinisikan operasi dasar database.
-type Database interface {
+// ErrNotFound adalah error yang dikembalikan ketika sebuah key tidak ditemukan di database.
+var ErrNotFound = errors.New("database: not found")
+
+// Snapshot adalah antarmuka untuk snapshot database yang read-only.
+type Snapshot interface {
 	Get(key []byte) ([]byte, error)
+	Has(key []byte) (bool, error)
+	Release()
+	NewIterator(slice *util.Range, ro *opt.ReadOptions) Iterator
+}
+
+// Iterator adalah antarmuka untuk iterator key-value.
+type Iterator interface {
+	Next() bool
+	Prev() bool
+	First() bool
+	Last() bool
+	Seek(key []byte) bool
+	Key() []byte
+	Value() []byte
+	Release()
+	Error() error
+}
+
+// Batch adalah antarmuka untuk operasi tulis batch.
+type Batch interface {
+	Put(key, value []byte)
+	Delete(key []byte)
+	Write() error
+	ValueSize() int
+	Reset()
+	Replay(w KeyValueWriter) error
+}
+
+// KeyValueWriter adalah antarmuka untuk menulis key-value.
+type KeyValueWriter interface {
 	Put(key []byte, value []byte) error
 	Delete(key []byte) error
+}
+
+// CompactionHook adalah antarmuka untuk hook yang dijalankan selama proses compact.
+type CompactionHook interface {
+	Run(compactedBytes int)
+}
+
+// Database adalah antarmuka generik untuk database key-value.
+type Database interface {
+	Put(key []byte, value []byte) error
+	Get(key []byte) ([]byte, error)
+	Delete(key []byte) error
+	Has(key []byte) (bool, error)
+	NewSnapshot() (Snapshot, error)
+	NewIterator(slice *util.Range, ro *opt.ReadOptions) Iterator
+	NewBatch() Batch
+	Stat() (string, error)
+	Compact(start, limit []byte) error
 	Close() error
-	GetEthDB() ethdb.Database
 }
 
-// LevelDB adalah implementasi Database menggunakan LevelDB.
-type LevelDB struct {
-	db *leveldb.DB
+// EthDBWrapper adalah implementasi dari antarmuka Database menggunakan LevelDB.
+type EthDBWrapper struct {
+	db         *leveldb.DB
+	path       string
+	mu         sync.RWMutex
+	compHook   CompactionHook
+	quitCompac chan chan error
 }
 
-// NewLevelDB membuat instance LevelDB baru.
-func NewLevelDB(path string) (*LevelDB, error) {
-	opts := &opt.Options{
-		Filter: filter.NewBloomFilter(10),
+// NewLevelDB membuat atau membuka database LevelDB di path yang diberikan.
+func NewLevelDB(path string) (Database, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, err
 	}
-	db, err := leveldb.OpenFile(path, opts)
+	o := &opt.Options{ErrorIfMissing: false}
+	db, err := leveldb.OpenFile(path, o)
 	if err != nil {
-		if ldb_errors.IsCorrupted(err) {
-			db, err = leveldb.RecoverFile(path, nil)
-		}
-		if err != nil {
-			return nil, err
-		}
+		return nil, fmt.Errorf("failed to open leveldb at %s: %w", path, err)
 	}
-	return &LevelDB{db: db}, nil
+	return &EthDBWrapper{db: db, path: path}, nil
 }
 
-// Get mengambil nilai berdasarkan kunci. Mengembalikan (nil, nil) jika tidak ditemukan secara internal.
-func (ldb *LevelDB) Get(key []byte) ([]byte, error) {
-	value, err := ldb.db.Get(key, nil)
+func (w *EthDBWrapper) Put(key []byte, value []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.db.Put(key, value, nil)
+}
+
+func (w *EthDBWrapper) Get(key []byte) ([]byte, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	value, err := w.db.Get(key, nil)
 	if errors.Is(err, leveldb.ErrNotFound) {
-		return nil, nil
+		return nil, ErrNotFound
 	}
 	return value, err
 }
 
-// Put menyimpan pasangan kunci-nilai.
-func (ldb *LevelDB) Put(key []byte, value []byte) error {
-	return ldb.db.Put(key, value, nil)
-}
-
-// Delete menghapus nilai berdasarkan kunci.
-func (ldb *LevelDB) Delete(key []byte) error {
-	return ldb.db.Delete(key, nil)
-}
-
-// Close menutup koneksi database.
-func (ldb *LevelDB) Close() error {
-	return ldb.db.Close()
-}
-
-// GetEthDB mengembalikan wrapper LevelDB yang mengimplementasikan ethdb.Database.
-// Baris 74 (kurang lebih, tergantung editor Anda)
-func (ldb *LevelDB) GetEthDB() ethdb.Database {
-	return &EthDBWrapper{ldb}
-}
-
-// EthDBWrapper adalah wrapper di sekitar LevelDB untuk implementasi ethdb.Database.
-type EthDBWrapper struct {
-	db *LevelDB
-}
-
-// Has memeriksa apakah kunci ada di database.
-func (w *EthDBWrapper) Has(key []byte) (bool, error) {
-	val, err := w.db.Get(key)
-	if err != nil {
-		return false, err
-	}
-	return val != nil, nil
-}
-
-// Get mengambil nilai. Mengembalikan ethdb.ErrNotFound jika tidak ditemukan.
-// Baris 99 (kurang lebih)
-func (w *EthDBWrapper) Get(key []byte) ([]byte, error) {
-	val, err := w.db.Get(key)
-	if err != nil {
-		return nil, err
-	}
-	if val == nil {
-		return nil, ethdb.ErrNotFound // Menggunakan ethdb.ErrNotFound
-	}
-	return val, nil
-}
-
-// Put menyimpan nilai.
-func (w *EthDBWrapper) Put(key []byte, value []byte) error {
-	return w.db.Put(key, value)
-}
-
-// Delete menghapus kunci.
 func (w *EthDBWrapper) Delete(key []byte) error {
-	return w.db.Delete(key)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.db.Delete(key, nil)
 }
 
-// DeleteRange menghapus rentang kunci.
-func (w *EthDBWrapper) DeleteRange(start, end []byte) error {
-	iter := w.db.db.NewIterator(&util.Range{Start: start, Limit: end}, nil)
-	defer iter.Release()
-	batch := new(leveldb.Batch)
-	for iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		copy(key, iter.Key())
-		batch.Delete(key)
-	}
-	if err := iter.Error(); err != nil {
-		return err
-	}
-	return w.db.db.Write(batch, nil)
+func (w *EthDBWrapper) Has(key []byte) (bool, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.db.Has(key, nil)
 }
 
-// NewBatch membuat batch baru.
-func (w *EthDBWrapper) NewBatch() ethdb.Batch {
-	return &BatchWrapper{batch: new(leveldb.Batch), db: w.db}
-}
-
-// NewBatchWithSize membuat batch baru dengan ukuran yang diisyaratkan.
-func (w *EthDBWrapper) NewBatchWithSize(size int) ethdb.Batch {
-	return &BatchWrapper{batch: new(leveldb.Batch), db: w.db, intendedSize: size}
-}
-
-// SnapshotWrapper membungkus snapshot LevelDB.
-type SnapshotWrapper struct {
+type snapshotWrapper struct {
 	snap *leveldb.Snapshot
 }
 
-// Get dari snapshot. Mengembalikan ethdb.ErrNotFound jika tidak ditemukan.
-// Baris 150 (kurang lebih)
-func (sw *SnapshotWrapper) Get(key []byte) ([]byte, error) {
+func (sw *snapshotWrapper) Get(key []byte) ([]byte, error) {
 	val, err := sw.snap.Get(key, nil)
 	if errors.Is(err, leveldb.ErrNotFound) {
-		return nil, ethdb.ErrNotFound // Menggunakan ethdb.ErrNotFound
+		return nil, ErrNotFound
 	}
 	return val, err
 }
-
-// Has pada snapshot.
-func (sw *SnapshotWrapper) Has(key []byte) (bool, error) {
-	return sw.snap.Has(key, nil)
+func (sw *snapshotWrapper) Has(key []byte) (bool, error) { return sw.snap.Has(key, nil) }
+func (sw *snapshotWrapper) Release()                     { sw.snap.Release() }
+func (sw *snapshotWrapper) NewIterator(slice *util.Range, ro *opt.ReadOptions) Iterator {
+	return sw.snap.NewIterator(slice, ro)
 }
 
-// NewIterator pada snapshot.
-func (sw *SnapshotWrapper) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
-	var rnge *util.Range
-	if prefix != nil {
-		rnge = util.BytesPrefix(prefix)
-		if start != nil && len(start) >= len(prefix) && strings.HasPrefix(string(start), string(prefix)) && string(start) > string(rnge.Start) {
-			rnge.Start = start
-		}
-	} else if start != nil {
-		rnge = &util.Range{Start: start}
-	}
-	return &IteratorWrapper{iter: sw.snap.NewIterator(rnge, nil)}
-}
-
-// Release melepaskan snapshot.
-func (sw *SnapshotWrapper) Release() {
-	sw.snap.Release()
-}
-
-// LDB mengembalikan objek LevelDB snapshot yang mendasarinya.
-func (sw *SnapshotWrapper) LDB() interface{} {
-	return sw.snap
-}
-
-// Implementasi Metered* untuk SnapshotWrapper (stub sederhana).
-func (sw *SnapshotWrapper) MeteredGet(key []byte) ([]byte, error) { return sw.Get(key) }
-func (sw *SnapshotWrapper) MeteredHas(key []byte) (bool, error)   { return sw.Has(key) }
-func (sw *SnapshotWrapper) MeteredNewIterator(prefix []byte, start []byte) ethdb.Iterator {
-	return sw.NewIterator(prefix, start)
-}
-
-// NewSnapshot membuat snapshot database baru.
-// Mengembalikan tipe ethdb.Snapshot.
-// Baris 192 (kurang lebih)
-func (w *EthDBWrapper) NewSnapshot() (ethdb.Snapshot, error) {
-	snap, err := w.db.db.GetSnapshot()
+func (w *EthDBWrapper) NewSnapshot() (Snapshot, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	snap, err := w.db.GetSnapshot()
 	if err != nil {
 		return nil, err
 	}
-	return &SnapshotWrapper{snap: snap}, nil
+	return &snapshotWrapper{snap: snap}, nil
 }
 
-// IteratorWrapper membungkus iterator LevelDB.
-type IteratorWrapper struct {
-	iter iterator.Iterator
+func (w *EthDBWrapper) NewIterator(slice *util.Range, ro *opt.ReadOptions) Iterator {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.db.NewIterator(slice, ro)
 }
 
-func (iw *IteratorWrapper) Next() bool   { return iw.iter.Next() }
-func (iw *IteratorWrapper) Error() error { return iw.iter.Error() }
-func (iw *IteratorWrapper) Key() []byte {
-	key := iw.iter.Key()
-	if key == nil {
-		return nil
-	}
-	copiedKey := make([]byte, len(key))
-	copy(copiedKey, key)
-	return copiedKey
+type levelDBBatch struct {
+	batch *leveldb.Batch
+	db    *EthDBWrapper
 }
-func (iw *IteratorWrapper) Value() []byte {
-	value := iw.iter.Value()
-	if value == nil {
-		return nil
-	}
-	copiedValue := make([]byte, len(value))
-	copy(copiedValue, value)
-	return copiedValue
-}
-func (iw *IteratorWrapper) Release() { iw.iter.Release() }
 
-// incrementBytes adalah fungsi helper untuk membuat batas atas untuk iterasi prefix.
-func incrementBytes(b []byte) []byte {
-	if len(b) == 0 {
-		return nil
+func (w *EthDBWrapper) NewBatch() Batch {
+	return &levelDBBatch{batch: new(leveldb.Batch), db: w}
+}
+
+func (b *levelDBBatch) Put(key, value []byte) { b.batch.Put(key, value) }
+func (b *levelDBBatch) Delete(key []byte)     { b.batch.Delete(key) }
+func (b *levelDBBatch) Write() error {
+	b.db.mu.Lock()
+	defer b.db.mu.Unlock()
+	return b.db.db.Write(b.batch, nil)
+}
+func (b *levelDBBatch) ValueSize() int { return b.batch.Len() }
+func (b *levelDBBatch) Reset()         { b.batch.Reset() }
+
+// keyValueWriterReplayer adalah adapter untuk menggunakan database.KeyValueWriter
+// dengan metode leveldb.Batch.Replay.
+type keyValueWriterReplayer struct {
+	writer KeyValueWriter
+	err    error // Untuk menangkap error pertama dari operasi writer
+}
+
+func (r *keyValueWriterReplayer) Put(key, value []byte) {
+	if r.err != nil {
+		return // Jangan lakukan operasi lebih lanjut jika sudah ada error
 	}
-	limit := make([]byte, len(b))
-	copy(limit, b)
-	for i := len(limit) - 1; i >= 0; i-- {
-		limit[i]++
-		if limit[i] != 0 {
-			return limit
+	r.err = r.writer.Put(key, value)
+}
+
+func (r *keyValueWriterReplayer) Delete(key []byte) {
+	if r.err != nil {
+		return
+	}
+	r.err = r.writer.Delete(key)
+}
+
+// Replay menjalankan kembali operasi batch pada writer yang diberikan.
+// Diperbaiki untuk menggunakan b.batch.Replay()
+func (b *levelDBBatch) Replay(writer KeyValueWriter) error {
+	replayer := &keyValueWriterReplayer{writer: writer}
+	// Metode Replay pada leveldb.Batch akan memanggil Put/Delete pada replayer.
+	// Error yang dikembalikan oleh b.batch.Replay adalah error dari proses replay itu sendiri (jarang terjadi).
+	if err := b.batch.Replay(replayer); err != nil {
+		return fmt.Errorf("leveldb batch replay failed: %w", err)
+	}
+	// Kembalikan error yang mungkin terjadi selama operasi Put/Delete pada KeyValueWriter.
+	return replayer.err
+}
+
+func (w *EthDBWrapper) Stat() (string, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	stats, err := w.db.GetProperty("leveldb.stats")
+	if err != nil {
+		return "", fmt.Errorf("failed to get leveldb stats: %w", err)
+	}
+	return stats, nil
+}
+
+func (w *EthDBWrapper) Compact(start, limit []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.db.CompactRange(util.Range{Start: start, Limit: limit})
+}
+
+func (w *EthDBWrapper) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.quitCompac != nil {
+		errCh := make(chan error)
+		w.quitCompac <- errCh
+		if err := <-errCh; err != nil {
+			fmt.Fprintf(os.Stderr, "Error stopping auto-compaction: %v\n", err)
 		}
+		w.quitCompac = nil
 	}
-	return nil // Overflow
+	return w.db.Close()
 }
 
-// NewIterator membuat iterator database baru.
-func (w *EthDBWrapper) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
-	var rnge *util.Range
-	if prefix != nil {
-		rnge = util.BytesPrefix(prefix)
-		if start != nil && len(start) >= len(prefix) && strings.HasPrefix(string(start), string(prefix)) && string(start) > string(rnge.Start) {
-			rnge.Start = start
+func (w *EthDBWrapper) SetCompactionHook(hook CompactionHook) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.compHook = hook
+}
+
+func (w *EthDBWrapper) StartAutoCompact() {
+	w.mu.Lock()
+	if w.quitCompac != nil {
+		w.mu.Unlock()
+		fmt.Println("Auto-compaction already running.")
+		return
+	}
+	w.quitCompac = make(chan chan error)
+	w.mu.Unlock()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "Auto-compaction goroutine panicked: %v\n", r)
+			}
+		}()
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		fmt.Println("Auto-compaction goroutine started.")
+		for {
+			select {
+			case errCh := <-w.quitCompac:
+				fmt.Println("Auto-compaction goroutine received stop signal.")
+				errCh <- nil
+				return
+			case <-ticker.C:
+				fmt.Println("Starting automatic database compaction...")
+				if err := w.Compact(nil, nil); err != nil {
+					fmt.Fprintf(os.Stderr, "Auto-compaction error: %v\n", err)
+				} else {
+					fmt.Println("Automatic database compaction finished.")
+					w.mu.RLock()
+					currentHook := w.compHook
+					w.mu.RUnlock()
+					if currentHook != nil {
+						currentHook.Run(0)
+					}
+				}
+			}
 		}
-	} else if start != nil {
-		rnge = &util.Range{Start: start}
-	}
-	return &IteratorWrapper{iter: w.db.db.NewIterator(rnge, nil)}
+	}()
 }
 
-// Stat mengembalikan properti database. Signature ini standar di go-ethereum v1.15.11.
-// Jika compiler Anda MENGINGINKAN Stat() (tanpa argumen), masalahnya ada pada
-// versi ethdb.Database yang dilihat oleh compiler Anda.
-func (w *EthDBWrapper) Stat(property string) (string, error) {
-	return w.db.db.GetProperty(property)
+// --- Implementasi MemDB ---
+type MemDB struct {
+	data map[string][]byte
+	mu   sync.RWMutex
 }
 
-// Compact memadatkan rentang kunci.
-func (w *EthDBWrapper) Compact(start []byte, limit []byte) error {
-	var r util.Range
-	if start != nil {
-		r.Start = start
-	}
-	if limit != nil {
-		r.Limit = limit
-	}
-	return w.db.db.CompactRange(r)
+func NewMemDB() (Database, error) {
+	return &MemDB{data: make(map[string][]byte)}, nil
 }
 
-// Implementasi stub untuk metode AncientStore.
-func (w *EthDBWrapper) AncientDatadir() (string, error) {
-	return "", errors.New("EthDBWrapper: AncientDatadir not implemented")
-}
-func (w *EthDBWrapper) Ancients() (uint64, error) {
-	return 0, errors.New("EthDBWrapper: Ancients not implemented")
-}
-func (w *EthDBWrapper) Ancient(kind string, number uint64) ([]byte, error) {
-	return nil, errors.New("EthDBWrapper: Ancient not implemented")
-}
-func (w *EthDBWrapper) AncientRange(kind string, start, count, maxBytes uint64) ([][]byte, error) {
-	return nil, errors.New("EthDBWrapper: AncientRange not implemented")
-}
-func (w *EthDBWrapper) HasAncient(kind string, number uint64) (bool, error) {
-	return false, errors.New("EthDBWrapper: HasAncient not implemented")
-}
-func (w *EthDBWrapper) AncientSize(kind string) (uint64, error) {
-	return 0, errors.New("EthDBWrapper: AncientSize not implemented")
-}
-func (w *EthDBWrapper) ModifyAncients(callback func(ethdb.AncientWriteOp) error) (int64, error) {
-	return 0, errors.New("EthDBWrapper: ModifyAncients not implemented")
-}
-func (w *EthDBWrapper) TruncateHead(n uint64) (uint64, error) {
-	return 0, errors.New("EthDBWrapper: TruncateHead not implemented")
-}
-func (w *EthDBWrapper) TruncateTail(n uint64) (uint64, error) {
-	return 0, errors.New("EthDBWrapper: TruncateTail not implemented")
-}
-func (w *EthDBWrapper) Sync() error { return errors.New("EthDBWrapper: Sync not implemented") }
-func (w *EthDBWrapper) ReadAncients(fn func(ethdb.AncientReaderOp) error) (err error) {
-	return errors.New("EthDBWrapper: ReadAncients not implemented")
-}
-func (w *EthDBWrapper) MigrateTable(name string, callback func(db ethdb.KeyValueWriter, it ethdb.Iterator) error) error {
-	return errors.New("EthDBWrapper: MigrateTable not implemented")
-}
-func (w *EthDBWrapper) Tail() (uint64, error) {
-	return 0, errors.New("EthDBWrapper: Tail not implemented")
-}
-
-// Implementasi stub untuk MeteredKeyValueStore.
-func (w *EthDBWrapper) MeteredGet(key []byte) ([]byte, error)     { return w.Get(key) }
-func (w *EthDBWrapper) MeteredPut(key []byte, value []byte) error { return w.Put(key, value) }
-func (w *EthDBWrapper) MeteredDelete(key []byte) error            { return w.Delete(key) }
-func (w *EthDBWrapper) MeteredHas(key []byte) (bool, error)       { return w.Has(key) }
-func (w *EthDBWrapper) MeteredNewIterator(prefix []byte, start []byte) ethdb.Iterator {
-	return w.NewIterator(prefix, start)
-}
-func (w *EthDBWrapper) MeteredNewBatch() ethdb.Batch                 { return w.NewBatch() }
-func (w *EthDBWrapper) MeteredNewBatchWithSize(size int) ethdb.Batch { return w.NewBatchWithSize(size) }
-
-// SetCompactionHook menggunakan tipe ethdb.CompactionHook.
-// Baris 323 (kurang lebih)
-func (w *EthDBWrapper) SetCompactionHook(hook ethdb.CompactionHook) {
-	// LevelDB tidak secara langsung mendukung CompactionHook melalui API ini.
-	// Implementasi stub.
-}
-func (w *EthDBWrapper) SetThrottle(config interface{}) error {
-	return errors.New("EthDBWrapper: SetThrottle not implemented")
-}
-func (w *EthDBWrapper) SetWriteBufferManager(manager interface{}) error {
-	return errors.New("EthDBWrapper: SetWriteBufferManager not implemented")
-}
-
-// LDB mengembalikan instance LevelDB yang mendasarinya.
-func (w *EthDBWrapper) LDB() interface{} { return w.db.db }
-
-// Close menutup database.
-func (w *EthDBWrapper) Close() error { return w.db.Close() }
-
-// BatchWrapper mengimplementasikan ethdb.Batch.
-type BatchWrapper struct {
-	batch        *leveldb.Batch
-	db           *LevelDB
-	size         int
-	intendedSize int
-}
-
-func (b *BatchWrapper) Put(key, value []byte) error {
-	b.batch.Put(key, value)
-	b.size += len(key) + len(value)
+func (m *MemDB) Put(key []byte, value []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	valCopy := make([]byte, len(value))
+	copy(valCopy, value)
+	m.data[string(key)] = valCopy
 	return nil
 }
-func (b *BatchWrapper) Delete(key []byte) error {
-	b.batch.Delete(key)
-	b.size += len(key)
+
+func (m *MemDB) Get(key []byte) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if value, ok := m.data[string(key)]; ok {
+		valCopy := make([]byte, len(value))
+		copy(valCopy, value)
+		return valCopy, nil
+	}
+	return nil, ErrNotFound
+}
+
+func (m *MemDB) Delete(key []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, string(key))
 	return nil
 }
-func (b *BatchWrapper) ValueSize() int { return b.size }
-func (b *BatchWrapper) Write() error   { return b.db.db.Write(b.batch, nil) }
-func (b *BatchWrapper) Reset() {
-	b.batch.Reset()
-	b.size = 0
+
+func (m *MemDB) Has(key []byte) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.data[string(key)]
+	return ok, nil
 }
-func (b *BatchWrapper) Replay(writer ethdb.KeyValueWriter) error {
-	return errors.New("BatchWrapper: Replay not implemented")
+
+type memSnapshotView struct {
+	dataCopy map[string][]byte
 }
+
+func (m *MemDB) NewSnapshot() (Snapshot, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	dc := make(map[string][]byte, len(m.data))
+	for k, v := range m.data {
+		vCopy := make([]byte, len(v))
+		copy(vCopy, v)
+		dc[k] = vCopy
+	}
+	return &memSnapshotView{dataCopy: dc}, nil
+}
+
+func (ms *memSnapshotView) Get(key []byte) ([]byte, error) {
+	if val, ok := ms.dataCopy[string(key)]; ok {
+		valCopy := make([]byte, len(val))
+		copy(valCopy, val)
+		return valCopy, nil
+	}
+	return nil, ErrNotFound
+}
+func (ms *memSnapshotView) Has(key []byte) (bool, error) {
+	_, ok := ms.dataCopy[string(key)]
+	return ok, nil
+}
+func (ms *memSnapshotView) Release() {}
+func (ms *memSnapshotView) NewIterator(slice *util.Range, ro *opt.ReadOptions) Iterator {
+	keys := make([]string, 0, len(ms.dataCopy))
+	for k := range ms.dataCopy {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return &memIterator{data: ms.dataCopy, keys: keys, current: -1, slice: slice}
+}
+
+func (m *MemDB) NewIterator(slice *util.Range, ro *opt.ReadOptions) Iterator {
+	m.mu.RLock()
+	keys := make([]string, 0, len(m.data))
+	dataCopy := make(map[string][]byte, len(m.data))
+	for k, v := range m.data {
+		keys = append(keys, k)
+		vCopy := make([]byte, len(v))
+		copy(vCopy, v)
+		dataCopy[k] = vCopy
+	}
+	m.mu.RUnlock()
+	sort.Strings(keys)
+	return &memIterator{data: dataCopy, keys: keys, current: -1, slice: slice}
+}
+
+type memIterator struct {
+	data    map[string][]byte
+	keys    []string
+	current int
+	slice   *util.Range
+	lastErr error
+}
+
+func (it *memIterator) Next() bool {
+	for {
+		it.current++
+		if it.current >= len(it.keys) {
+			return false
+		}
+		keyBytes := []byte(it.keys[it.current])
+		if it.slice != nil {
+			if it.slice.Start != nil && bytes.Compare(keyBytes, it.slice.Start) < 0 { // Diperbaiki
+				continue
+			}
+			if it.slice.Limit != nil && bytes.Compare(keyBytes, it.slice.Limit) >= 0 { // Diperbaiki
+				return false
+			}
+		}
+		return true
+	}
+}
+func (it *memIterator) Prev() bool {
+	for {
+		it.current--
+		if it.current < 0 {
+			return false
+		}
+		keyBytes := []byte(it.keys[it.current])
+		if it.slice != nil {
+			if it.slice.Limit != nil && bytes.Compare(keyBytes, it.slice.Limit) >= 0 { // Diperbaiki
+				continue
+			}
+			if it.slice.Start != nil && bytes.Compare(keyBytes, it.slice.Start) < 0 { // Diperbaiki
+				return false
+			}
+		}
+		return true
+	}
+}
+func (it *memIterator) First() bool {
+	it.current = -1
+	return it.Next()
+}
+func (it *memIterator) Last() bool {
+	it.current = len(it.keys)
+	return it.Prev()
+}
+func (it *memIterator) Seek(key []byte) bool {
+	idx := sort.SearchStrings(it.keys, string(key))
+	it.current = idx - 1
+	return it.Next()
+}
+func (it *memIterator) Key() []byte {
+	if it.current < 0 || it.current >= len(it.keys) {
+		return nil
+	}
+	return []byte(it.keys[it.current])
+}
+func (it *memIterator) Value() []byte {
+	if it.current < 0 || it.current >= len(it.keys) {
+		return nil
+	}
+	val, _ := it.data[it.keys[it.current]]
+	return val
+}
+func (it *memIterator) Release() {
+	it.keys = nil
+	it.data = nil
+}
+func (it *memIterator) Error() error { return it.lastErr }
+
+type memBatch struct {
+	db   *MemDB
+	ops  []batchOp
+	size int
+}
+type batchOp struct {
+	isPut bool
+	key   []byte
+	value []byte
+}
+
+func (m *MemDB) NewBatch() Batch {
+	return &memBatch{db: m, ops: make([]batchOp, 0)}
+}
+func (b *memBatch) Put(key, value []byte) {
+	k := make([]byte, len(key))
+	copy(k, key)
+	v := make([]byte, len(value))
+	copy(v, value)
+	b.ops = append(b.ops, batchOp{isPut: true, key: k, value: v})
+	b.size += len(v)
+}
+func (b *memBatch) Delete(key []byte) {
+	k := make([]byte, len(key))
+	copy(k, key)
+	b.ops = append(b.ops, batchOp{isPut: false, key: k})
+}
+func (b *memBatch) Write() error {
+	b.db.mu.Lock()
+	defer b.db.mu.Unlock()
+	for _, op := range b.ops {
+		if op.isPut {
+			valCopy := make([]byte, len(op.value))
+			copy(valCopy, op.value)
+			b.db.data[string(op.key)] = valCopy
+		} else {
+			delete(b.db.data, string(op.key))
+		}
+	}
+	b.Reset()
+	return nil
+}
+func (b *memBatch) ValueSize() int { return b.size }
+func (b *memBatch) Reset()         { b.ops = make([]batchOp, 0); b.size = 0 }
+func (b *memBatch) Replay(w KeyValueWriter) error {
+	for _, op := range b.ops {
+		if op.isPut {
+			if err := w.Put(op.key, op.value); err != nil {
+				return err
+			}
+		} else {
+			if err := w.Delete(op.key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *MemDB) Stat() (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return fmt.Sprintf("MemDB: %d items", len(m.data)), nil
+}
+func (m *MemDB) Compact(start, limit []byte) error { return nil }
+func (m *MemDB) Close() error                      { return nil }
+
+var _ Database = (*EthDBWrapper)(nil)
+var _ Snapshot = (*snapshotWrapper)(nil)
+var _ Batch = (*levelDBBatch)(nil)
+var _ Iterator = (iterator.Iterator)(nil)
+var _ Database = (*MemDB)(nil)
+var _ Snapshot = (*memSnapshotView)(nil)
+var _ Batch = (*memBatch)(nil)
+var _ Iterator = (*memIterator)(nil)
