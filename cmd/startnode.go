@@ -1,22 +1,21 @@
 package cmd
 
 import (
-	"blockchain-node/config"
+	"blockchain-node/config" // Impor config aplikasi
 	"blockchain-node/consensus"
 	"blockchain-node/core"
 	"blockchain-node/crypto"
-	"blockchain-node/execution"
+	"blockchain-node/execution" // Atau "blockchain-node/evm" jika Anda beralih
 	"blockchain-node/health"
 	"blockchain-node/logger"
 	"blockchain-node/metrics"
 	"blockchain-node/network"
 	"blockchain-node/rpc"
-
-	// "blockchain-node/security" // Komentari jika tidak digunakan atau menyebabkan error
 	"context"
 	"crypto/ecdsa"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -28,120 +27,136 @@ import (
 	"syscall"
 	"time"
 
-	// Hapus atau ganti impor ini jika menyebabkan masalah dan tidak esensial untuk Node ID Anda
-	// "github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper" // Impor viper untuk mendapatkan nilai flag/config
 )
 
 var startNodeCmd = &cobra.Command{
 	Use:   "startnode",
 	Short: "Start the custom blockchain node",
 	Long:  `Start the custom blockchain node with P2P networking, RPC server, and optional mining.`,
-	RunE:  runStartNode,
+	RunE:  runStartNode, // Menggunakan RunE untuk error handling yang lebih baik
+}
+
+func init() {
+	// Flag yang spesifik untuk 'startnode'
+	// Nilai default diambil dari config.DefaultConfig agar konsisten
+	startNodeCmd.Flags().Bool("mining", config.DefaultConfig.Mining, "Enable mining")
+	startNodeCmd.Flags().String("miner", config.DefaultConfig.Miner, "Miner address for rewards (e.g., 0xYourAddress)")
+
+	// Bind flag ini ke Viper agar bisa ditimpa oleh config file atau ENV var
+	// Nama yang di-bind harus cocok dengan key di struct Config dan file config.yaml
+	viper.BindPFlag("mining", startNodeCmd.Flags().Lookup("mining"))
+	viper.BindPFlag("miner", startNodeCmd.Flags().Lookup("miner"))
 }
 
 func loadOrGenerateNodeKey(datadir string) (*ecdsa.PrivateKey, error) {
-	// Pastikan direktori datadir ada, atau setidaknya direktori untuk nodekey
-	p2pKeyDir := filepath.Join(datadir, "p2p") // Simpan di dalam subdirektori p2p
-	if err := os.MkdirAll(p2pKeyDir, 0700); err != nil {
+	p2pKeyDir := filepath.Join(datadir, "p2p")
+	if err := os.MkdirAll(p2pKeyDir, 0700); err != nil { // 0700 untuk direktori kunci privat
 		return nil, fmt.Errorf("failed to create p2p key directory %s: %v", p2pKeyDir, err)
 	}
 	keyfilePath := filepath.Join(p2pKeyDir, "node.key")
 
 	keyBytes, err := os.ReadFile(keyfilePath)
 	if err == nil {
-		privKey, errPriv := crypto.ToECDSA(keyBytes)
+		privKey, errPriv := crypto.ToECDSA(keyBytes) // Asumsi ToECDSA ada di package crypto Anda
 		if errPriv == nil {
 			logger.Infof("Loaded P2P node key from %s", keyfilePath)
 			return privKey, nil
 		}
-		logger.Warningf("Failed to load P2P node key from %s: %v. Generating new one.", keyfilePath, errPriv)
+		logger.Warningf("Failed to parse P2P node key from %s: %v. Generating new one.", keyfilePath, errPriv)
 	} else if !os.IsNotExist(err) {
+		// Hanya log warning jika errornya bukan karena file tidak ada
 		logger.Warningf("Error reading P2P node key file %s: %v. Generating new one.", keyfilePath, err)
 	}
 
+	// GenerateEthKeyPair untuk kunci yang kompatibel dengan Ethereum (secp256k1)
 	privKey, _, err := crypto.GenerateEthKeyPair()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate P2P node key: %v", err)
 	}
-	if err := os.WriteFile(keyfilePath, crypto.FromECDSA(privKey), 0600); err != nil {
+	// FromECDSA untuk serialisasi kunci privat
+	if err := os.WriteFile(keyfilePath, crypto.FromECDSA(privKey), 0600); err != nil { // 0600 untuk file kunci privat
 		return nil, fmt.Errorf("failed to save P2P node key to %s: %v", keyfilePath, err)
 	}
 	logger.Infof("Generated and saved new P2P node key to %s", keyfilePath)
 	return privKey, nil
 }
 
-// Helper untuk mendapatkan alamat IP non-loopback pertama yang ditemukan
 func getOutboundIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80") // Tidak benar-benar mengirim data
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, address := range addrs {
+			if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					logger.Debugf("Determined outbound IP from interfaces: %s", ipnet.IP.String())
+					return ipnet.IP.String()
+				}
+			}
+		}
+	}
+	// Fallback jika tidak ada IP non-loopback yang cocok ditemukan
+	conn, err := net.DialTimeout("udp", "8.8.8.8:80", 2*time.Second) // Tambahkan timeout
 	if err != nil {
-		logger.Warningf("Could not determine outbound IP, defaulting to 127.0.0.1: %v", err)
+		logger.Warningf("Could not determine outbound IP using DNS, defaulting to 127.0.0.1: %v", err)
 		return "127.0.0.1"
 	}
 	defer conn.Close()
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	logger.Debugf("Determined outbound IP via UDP dial: %s", localAddr.IP.String())
 	return localAddr.IP.String()
 }
 
 func runStartNode(cmd *cobra.Command, args []string) error {
-	cfg, err := config.LoadConfig()
+	// cfgNodeApp adalah *config.Config dari package config aplikasi Anda
+	cfgNodeApp, err := config.LoadConfig()
 	if err != nil {
-		return fmt.Errorf("failed to load config: %v", err)
+		// Tidak perlu logger.Fatal di sini, cukup return error
+		// fmt.Fprintf(os.Stderr, "Failed to load application config: %v\n", err)
+		return fmt.Errorf("failed to load application config: %v", err)
 	}
 
-	logger.SetLevel(cfg.GetLogLevel())
-	logger.Info("Starting custom blockchain node...")
-	logger.Infof("Effective Configuration: DataDir=%s, P2PPort=%d, RPCPort=%d, HealthPort=%d, Mining=%t, Miner=%s, ChainID=%d, LogLevelString=%s",
-		cfg.DataDir, cfg.Port, cfg.RPCPort, cfg.HealthPort, cfg.Mining, cfg.Miner, cfg.ChainID, cfg.LogLevel)
+	logger.SetLevel(cfgNodeApp.GetLogLevel())
+	logger.Info("Starting Lumina Blockchain Node...")
+	logger.Infof("Effective Application Configuration: DataDir=%s, P2PPort=%d, RPCPort=%d, HealthPort=%d, Mining=%t, Miner=%s, ChainID=%d, LogLevelString=%s, ForceGenesis=%t, GenesisFilePath='%s', BootNodes=%v",
+		cfgNodeApp.DataDir, cfgNodeApp.Port, cfgNodeApp.RPCPort, cfgNodeApp.HealthPort, cfgNodeApp.Mining, cfgNodeApp.Miner, cfgNodeApp.ChainID, cfgNodeApp.LogLevel, cfgNodeApp.ForceGenesis, cfgNodeApp.GenesisFilePath, cfgNodeApp.BootNodes)
 
-	nodeKey, err := loadOrGenerateNodeKey(cfg.DataDir)
+	nodeKey, err := loadOrGenerateNodeKey(cfgNodeApp.DataDir)
 	if err != nil {
-		// logger.Fatalf sudah memanggil os.Exit(1), jadi return err tidak akan tercapai
-		// Lebih baik log error dan return error agar bisa ditangani di main.go
-		logger.Errorf("Failed to load or generate P2P node key: %v", err)
+		// logger.Errorf sudah mencatat, jadi return error saja
 		return fmt.Errorf("failed to load or generate P2P node key: %v", err)
 	}
 
-	// Membuat Node ID dari public key P2P
-	// Public key ECDSA (kurva secp256k1) adalah 64 byte (X dan Y concatenated).
-	// Node ID adalah representasi heksadesimal dari public key ini.
-	// crypto.FromECDSAPub mengembalikan public key dalam format uncompressed (0x04 + X + Y)
 	publicKeyBytesUncompressed := crypto.FromECDSAPub(&nodeKey.PublicKey)
 	var nodeIDHex string
 	if len(publicKeyBytesUncompressed) == 65 && publicKeyBytesUncompressed[0] == 0x04 {
-		nodeIDHex = hex.EncodeToString(publicKeyBytesUncompressed[1:]) // Ambil X dan Y (64 bytes)
+		nodeIDHex = hex.EncodeToString(publicKeyBytesUncompressed[1:])
 	} else {
-		// Fallback jika format tidak terduga, ini seharusnya tidak terjadi dengan GenerateEthKeyPair
-		logger.Warningf("P2P public key has unexpected format/length: %d. Enode URL might be incorrect.", len(publicKeyBytesUncompressed))
-		// Sebagai fallback yang sangat sederhana, kita bisa hash public key, tapi ini bukan Node ID standar.
-		// Untuk sekarang, kita akan biarkan nodeIDHex kosong atau beri nilai placeholder jika error.
-		// Lebih baik memastikan crypto.FromECDSAPub menghasilkan format yang benar.
-		nodeIDHex = hex.EncodeToString(crypto.Keccak256(publicKeyBytesUncompressed)[:32]) // Ini BUKAN Node ID standar Ethereum
+		logger.Errorf("P2P public key has unexpected format (length: %d, prefix: %x). Cannot derive valid Node ID.", len(publicKeyBytesUncompressed), publicKeyBytesUncompressed[0])
+		return fmt.Errorf("P2P public key has unexpected format, cannot derive Node ID")
 	}
 
-	localIP := getOutboundIP() // Mencoba mendapatkan IP yang bisa dijangkau
-	if cfg.RPCAddr != "0.0.0.0" && cfg.RPCAddr != "127.0.0.1" && cfg.RPCAddr != "localhost" {
-		// Jika RPCAddr diset ke IP spesifik, gunakan itu untuk enode jika relevan
-		// Namun, untuk P2P, IP yang bisa dijangkau dari luar lebih penting.
-		// localIP = cfg.RPCAddr // Pertimbangkan ini jika RPCAddr adalah IP publik Anda
-	}
+	localIP := getOutboundIP()
+	enodeURL := fmt.Sprintf("enode://%s@%s:%d", nodeIDHex, localIP, cfgNodeApp.Port)
+	logger.Infof("Node Enode URL (best effort, check if behind NAT): %s", enodeURL)
 
-	enodeURL := fmt.Sprintf("enode://%s@%s:%d", nodeIDHex, localIP, cfg.Port)
-	logger.Infof("Node Enode URL: %s", enodeURL)
-
-	blockchainConfig := &core.Config{
-		DataDir:       cfg.DataDir,
-		ChainID:       cfg.ChainID,
-		BlockGasLimit: cfg.BlockGasLimit,
+	// blockchainCoreConfig adalah *core.Config
+	blockchainCoreConfig := &core.Config{
+		DataDir:       cfgNodeApp.DataDir,
+		ChainID:       cfgNodeApp.ChainID,
+		BlockGasLimit: cfgNodeApp.BlockGasLimit,
+		// Jika Anda ingin core.Config juga tahu path genesis, tambahkan di sini:
+		// GenesisFilePath: cfgNodeApp.GenesisFilePath,
 	}
-	blockchain, err := core.NewBlockchain(blockchainConfig)
+	// PERBAIKAN: Teruskan cfgNodeApp (config aplikasi) ke NewBlockchain sebagai argumen kedua
+	blockchain, err := core.NewBlockchain(blockchainCoreConfig, cfgNodeApp)
 	if err != nil {
 		return fmt.Errorf("failed to initialize blockchain: %v", err)
 	}
 	defer func() {
 		logger.Info("Closing blockchain...")
 		if err := blockchain.Close(); err != nil {
-			logger.Errorf("Failed to close blockchain: %v", err)
+			logger.Errorf("Error closing blockchain: %v", err)
 		}
 	}()
 
@@ -152,7 +167,7 @@ func runStartNode(cmd *cobra.Command, args []string) error {
 	blockchain.SetVirtualMachine(vm)
 
 	var healthChecker *health.HealthChecker
-	if cfg.EnableHealth {
+	if cfgNodeApp.EnableHealth {
 		healthChecker = health.NewHealthChecker(blockchain, blockchain.GetDatabase())
 	}
 
@@ -160,14 +175,18 @@ func runStartNode(cmd *cobra.Command, args []string) error {
 	defer cancel()
 	var wg sync.WaitGroup
 
-	if cfg.EnableP2P {
-		p2pServer := network.NewServer(cfg.Port, blockchain, nodeKey, enodeURL, cfg.BootNodes)
+	if cfgNodeApp.EnableP2P {
+		p2pServer := network.NewServer(cfgNodeApp.Port, blockchain, nodeKey, enodeURL, cfgNodeApp.BootNodes)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			logger.Infof("Starting P2P server on port %d", cfg.Port)
+			logger.Infof("Starting P2P server on port %d", cfgNodeApp.Port)
 			if err := p2pServer.Start(ctx); err != nil {
-				logger.Errorf("P2P server error: %v", err)
+				if !strings.Contains(err.Error(), "use of closed network connection") && !errors.Is(err, context.Canceled) {
+					logger.Errorf("P2P server error: %v", err)
+				} else {
+					logger.Info("P2P server shut down.")
+				}
 				cancel()
 			}
 		}()
@@ -176,55 +195,65 @@ func runStartNode(cmd *cobra.Command, args []string) error {
 	}
 
 	rpcConfig := &rpc.Config{
-		Host: cfg.RPCAddr,
-		Port: cfg.RPCPort,
+		Host: cfgNodeApp.RPCAddr,
+		Port: cfgNodeApp.RPCPort,
 	}
 	rpcServer := rpc.NewServer(rpcConfig, blockchain)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		logger.Infof("Starting RPC server on %s:%d", cfg.RPCAddr, cfg.RPCPort)
-		if err := rpcServer.Start(); err != nil {
-			logger.Errorf("RPC server error: %v", err)
-			cancel()
-		}
-	}()
+	logger.Infof("Attempting to start RPC server on %s:%d", cfgNodeApp.RPCAddr, cfgNodeApp.RPCPort)
+	if err := rpcServer.Start(); err != nil {
+		logger.Errorf("Failed to start RPC server: %v", err)
+		cancel()
+		// return fmt.Errorf("failed to start RPC server: %v") // Bisa keluar jika RPC kritikal
+	} else {
+		logger.Info("RPC server started.")
+		// RPC server Stop akan dipanggil saat shutdown
+		defer func() {
+			logger.Info("Stopping RPC server...")
+			rpcServer.Stop()
+			logger.Info("RPC server stopped.")
+		}()
+	}
 
 	var healthServer *http.Server
-	if cfg.EnableHealth && healthChecker != nil {
+	if cfgNodeApp.EnableHealth && healthChecker != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			healthPort := cfg.HealthPort
+			healthAddr := fmt.Sprintf(":%d", cfgNodeApp.HealthPort)
 			mux := http.NewServeMux()
 			mux.HandleFunc("/health", healthChecker.HealthHandler)
 			mux.HandleFunc("/ready", healthChecker.ReadinessHandler)
-			if cfg.EnableMetrics {
+			if cfgNodeApp.EnableMetrics {
 				mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 					metricsData := metrics.GetMetrics().ToMap()
 					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusOK)
-					json.NewEncoder(w).Encode(metricsData)
+					if err := json.NewEncoder(w).Encode(metricsData); err != nil {
+						logger.Errorf("Failed to encode metrics data: %v", err)
+						http.Error(w, "Error encoding metrics", http.StatusInternalServerError)
+					}
 				})
 			}
-			healthServer = &http.Server{Addr: fmt.Sprintf(":%d", healthPort), Handler: mux}
-			logger.Infof("Starting health & metrics server on port %d", healthPort)
+			healthServer = &http.Server{Addr: healthAddr, Handler: mux}
+			logger.Infof("Starting health & metrics server on %s", healthAddr)
 
 			serverErrCh := make(chan error, 1)
 			go func() {
-				serverErrCh <- healthServer.ListenAndServe()
+				if err := healthServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					serverErrCh <- err
+				}
+				close(serverErrCh)
 			}()
 
 			select {
 			case err := <-serverErrCh:
-				if err != nil && err != http.ErrServerClosed {
+				if err != nil {
 					logger.Errorf("Health server error: %v", err)
+					cancel()
 				}
 			case <-ctx.Done():
-				// Konteks dibatalkan, mulai shutdown server
+				logger.Info("Context cancelled, shutting down health server...")
 			}
 
-			logger.Info("Shutting down health & metrics server...")
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer shutdownCancel()
 			if err := healthServer.Shutdown(shutdownCtx); err != nil {
@@ -234,19 +263,10 @@ func runStartNode(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	miningEnabledByFlag, _ := cmd.Flags().GetBool("mining")
-	minerAddrStrByFlag, _ := cmd.Flags().GetString("miner")
+	finalMiningEnabled := viper.GetBool("mining")
+	finalMinerAddrStr := viper.GetString("miner")
 
-	finalMiningEnabled := cfg.Mining
-	if cmd.Flags().Changed("mining") {
-		finalMiningEnabled = miningEnabledByFlag
-	}
-	finalMinerAddrStr := cfg.Miner
-	if cmd.Flags().Changed("miner") {
-		finalMinerAddrStr = minerAddrStrByFlag
-	}
-
-	var minerInstance *core.Miner // Deklarasikan di sini agar bisa di-Stop
+	var minerInstance *core.Miner
 	if finalMiningEnabled {
 		if finalMinerAddrStr == "" {
 			logger.Warning("Mining enabled but no miner address specified. Mining will not start.")
@@ -261,11 +281,12 @@ func runStartNode(cmd *cobra.Command, args []string) error {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					logger.Infof("Starting miner with address: %s", finalMinerAddrStr)
-					minerInstance.Start() // Start() harus non-blocking atau dijalankan di goroutine sendiri oleh Start()
+					logger.Infof("Miner starting for address: %s", finalMinerAddrStr)
+					minerInstance.Start()
 					<-ctx.Done()
-					logger.Info("Received stop signal for miner, stopping...")
+					logger.Info("Miner received shutdown signal, stopping...")
 					minerInstance.Stop()
+					logger.Info("Miner stopped.")
 				}()
 			}
 		}
@@ -273,7 +294,7 @@ func runStartNode(cmd *cobra.Command, args []string) error {
 		logger.Info("Mining is disabled.")
 	}
 
-	logger.Info("Custom blockchain node started successfully. Press Ctrl+C to stop.")
+	logger.Info("Lumina Blockchain Node started successfully. Press Ctrl+C to stop.")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -281,26 +302,28 @@ func runStartNode(cmd *cobra.Command, args []string) error {
 	case s := <-sigCh:
 		logger.Infof("Received signal: %v, initiating shutdown...", s)
 	case <-ctx.Done():
-		logger.Info("Context cancelled by other service error, initiating shutdown...")
+		logger.Info("Context cancelled (e.g., by service error), initiating shutdown...")
 	}
 
-	logger.Info("Broadcasting shutdown signal to all services...")
-	cancel() // Signal semua goroutine untuk berhenti
+	logger.Info("Shutting down services...")
+	cancel()
 
-	// Beri waktu untuk goroutine selesai
-	shutdownCompleted := make(chan struct{})
+	shutdownGracePeriod := 10 * time.Second
+	logger.Infof("Waiting up to %v for services to shut down gracefully...", shutdownGracePeriod)
+
+	doneWg := make(chan struct{})
 	go func() {
-		wg.Wait() // Tunggu semua goroutine yang di-Add ke wg selesai
-		close(shutdownCompleted)
+		wg.Wait()
+		close(doneWg)
 	}()
 
 	select {
-	case <-shutdownCompleted:
-		logger.Info("All services stopped gracefully.")
-	case <-time.After(10 * time.Second):
-		logger.Warning("Timeout waiting for services to stop. Forcing exit.")
+	case <-doneWg:
+		logger.Info("All managed goroutines stopped gracefully.")
+	case <-time.After(shutdownGracePeriod):
+		logger.Warningf("Shutdown grace period of %v exceeded. Some services might not have stopped cleanly.", shutdownGracePeriod)
 	}
 
-	logger.Info("Custom blockchain node stopped.")
+	logger.Info("Lumina Blockchain Node shut down complete.")
 	return nil
 }
