@@ -310,29 +310,37 @@ func (s *Server) performHandshake(peer *Peer) error {
 }
 
 func (s *Server) prepareStatusMessage() (*StatusMessage, error) {
-	currentBlock := s.blockchain.GetCurrentBlock()
-	genesisBlock := s.blockchain.GetBlockByNumber(0)
+	currentBlock := s.blockchain.GetCurrentBlock()   // Mungkin nil untuk node baru
+	genesisBlock := s.blockchain.GetBlockByNumber(0) // Seharusnya mengembalikan genesis teoritis setelah modifikasi di atas
 
-	if currentBlock == nil || genesisBlock == nil {
-		return nil, errors.New("blockchain not fully initialized for status message (current or genesis is nil)")
+	if genesisBlock == nil { // Pemeriksaan utama sekarang pada ketersediaan genesisBlock
+		return nil, errors.New("blockchain not fully initialized for status message (genesis block is unknown)")
 	}
 
-	// Perbaikan: Memanggil GetTotalDifficulty dari s.blockchain
-	td := s.blockchain.GetTotalDifficulty() // Asumsi metode ini sudah ada di core.Blockchain
-	if td == nil {
-		logger.Warning("Failed to get total difficulty, using current block's difficulty as fallback for status.")
-		td = new(big.Int).Set(currentBlock.Header.GetDifficulty())
+	var currentBlockActualHash [32]byte
+	var td *big.Int
+	chainConfig := s.blockchain.GetConfig() // Dapatkan config chain
+
+	if currentBlock != nil {
+		currentBlockActualHash = currentBlock.Header.GetHash()
+		td = s.blockchain.GetTotalDifficulty()
+	} else {
+		// Node baru: gunakan hash genesis sebagai currentBlock untuk pesan status,
+		// dan kesulitan genesis sebagai Total Difficulty (TD).
+		currentBlockActualHash = genesisBlock.Header.GetHash()
+		td = new(big.Int).Set(genesisBlock.Header.GetDifficulty()) // Salin nilai kesulitan
+		logger.Debugf("prepareStatusMessage: currentBlock is nil, using genesis hash %x as currentBlockActualHash and genesis difficulty %s as TD for status message.", currentBlockActualHash, td.String())
 	}
 
-	currentBlockHash := currentBlock.Header.GetHash() // Simpan ke variabel
-	genesisBlockHash := genesisBlock.Header.GetHash() // Simpan ke variabel
+	// Dapatkan genesis hash dari objek genesisBlock yang sudah pasti ada
+	genesisBlockHash := genesisBlock.Header.GetHash()
 
 	return &StatusMessage{
-		ProtocolVersion: 1,
-		NetworkID:       s.blockchain.GetConfig().GetChainID(),
+		ProtocolVersion: 1,                        // Sesuaikan jika Anda memiliki versi protokol
+		NetworkID:       chainConfig.GetChainID(), // Gunakan metode GetChainID dari config
 		TD:              td,
-		CurrentBlock:    currentBlockHash, // Gunakan variabel
-		GenesisBlock:    genesisBlockHash, // Gunakan variabel
+		CurrentBlock:    currentBlockActualHash,
+		GenesisBlock:    genesisBlockHash,
 	}, nil
 }
 

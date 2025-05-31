@@ -6,7 +6,7 @@ enable_p2p: true
 rpcport: 8545
 rpcaddr: "0.0.0.0"
 mining: true
-miner: "0x50e8f7d870f4c22e00302c94a76a5cdf5f507961"
+miner: "0xa4fc677d0aeeb42357a1822e6a3cb83bc51a4130"
 maxpeers: 100
 chainid: 1
 blockgaslimit: 10000000

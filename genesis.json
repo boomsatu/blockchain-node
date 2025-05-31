@@ -1,7 +1,7 @@
 
 {
   "config": {
-    "chainId": 1337,
+    "chainId": 1,
     "homesteadBlock": 0,
     "byzantiumBlock": 0,
     "constantinopleBlock": 0,
@@ -11,11 +11,8 @@
     "londonBlock": 0
   },
   "alloc": {
-    "0x742d35Cc6635C0532925a3b8D5c6C1C8b1c5C6C": {
+    "0xa4fc677d0aeeb42357a1822e6a3cb83bc51a4130": {
       "balance": "1000000000000000000"
-    },
-    "0x8ba1f109551bD432803012645Hac136c46C01": {
-      "balance": "5000000000000000000"
     }
   },
   "coinbase": "0x0000000000000000000000000000000000000000",

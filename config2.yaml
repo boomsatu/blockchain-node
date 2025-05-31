@@ -1,0 +1,25 @@
+# config.yaml
+datadir: "./lumina_data_node2"
+port: 30304
+debug: debug
+bootnode:
+  "enode://356f28910e392ac011b53bc3b5d19f101545a4b92dacad760b64a877c691e36b626a5af88b61cde9b10fbd96a9f05bc0bf5a97baa436ea13e4be30f18b5e7ca9@192.168.56.1:30303"
+enable_p2p: true
+rpcport: 8546
+rpcaddr: "0.0.0.0"
+mining: true
+miner: "0xbe1ae57cdd8dbde4b167fc9c2f65f806f0c58998"
+maxpeers: 100
+chainid: 1
+blockgaslimit: 10000000
+cache: 512
+handles: 512
+verbosity: 2
+enable_rate_limit: true
+rate_limit: 1000
+rate_limit_window: "1m"
+enable_cache: true
+cache_size: 10000
+connection_timeout: "30s"
+health_check_interval: "30s"
+enable_metrics: false
