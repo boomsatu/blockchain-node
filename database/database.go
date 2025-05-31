@@ -4,7 +4,9 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/ethereum/go-ethereum/ethdb" // Target: Go-Ethereum v1.15.11
+	"github.com/ethereum/go-ethereum/ethdb" // PASTIKAN package ini ter-resolve dengan benar
+	// oleh Go environment Anda dan versinya (misalnya v1.15.11)
+	// mengekspor ErrNotFound, Snapshot, dan CompactionHook.
 	"github.com/syndtr/goleveldb/leveldb"
 	ldb_errors "github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
@@ -69,6 +71,7 @@ func (ldb *LevelDB) Close() error {
 }
 
 // GetEthDB mengembalikan wrapper LevelDB yang mengimplementasikan ethdb.Database.
+// Baris 74 (kurang lebih, tergantung editor Anda)
 func (ldb *LevelDB) GetEthDB() ethdb.Database {
 	return &EthDBWrapper{ldb}
 }
@@ -88,6 +91,7 @@ func (w *EthDBWrapper) Has(key []byte) (bool, error) {
 }
 
 // Get mengambil nilai. Mengembalikan ethdb.ErrNotFound jika tidak ditemukan.
+// Baris 99 (kurang lebih)
 func (w *EthDBWrapper) Get(key []byte) ([]byte, error) {
 	val, err := w.db.Get(key)
 	if err != nil {
@@ -141,6 +145,7 @@ type SnapshotWrapper struct {
 }
 
 // Get dari snapshot. Mengembalikan ethdb.ErrNotFound jika tidak ditemukan.
+// Baris 150 (kurang lebih)
 func (sw *SnapshotWrapper) Get(key []byte) ([]byte, error) {
 	val, err := sw.snap.Get(key, nil)
 	if errors.Is(err, leveldb.ErrNotFound) {
@@ -187,6 +192,7 @@ func (sw *SnapshotWrapper) MeteredNewIterator(prefix []byte, start []byte) ethdb
 
 // NewSnapshot membuat snapshot database baru.
 // Mengembalikan tipe ethdb.Snapshot.
+// Baris 192 (kurang lebih)
 func (w *EthDBWrapper) NewSnapshot() (ethdb.Snapshot, error) {
 	snap, err := w.db.db.GetSnapshot()
 	if err != nil {
@@ -252,7 +258,9 @@ func (w *EthDBWrapper) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	return &IteratorWrapper{iter: w.db.db.NewIterator(rnge, nil)}
 }
 
-// Stat mengembalikan properti database. Sesuai dengan go-ethereum v1.15.11.
+// Stat mengembalikan properti database. Signature ini standar di go-ethereum v1.15.11.
+// Jika compiler Anda MENGINGINKAN Stat() (tanpa argumen), masalahnya ada pada
+// versi ethdb.Database yang dilihat oleh compiler Anda.
 func (w *EthDBWrapper) Stat(property string) (string, error) {
 	return w.db.db.GetProperty(property)
 }
@@ -320,6 +328,7 @@ func (w *EthDBWrapper) MeteredNewBatch() ethdb.Batch                 { return w.
 func (w *EthDBWrapper) MeteredNewBatchWithSize(size int) ethdb.Batch { return w.NewBatchWithSize(size) }
 
 // SetCompactionHook menggunakan tipe ethdb.CompactionHook.
+// Baris 323 (kurang lebih)
 func (w *EthDBWrapper) SetCompactionHook(hook ethdb.CompactionHook) {
 	// LevelDB tidak secara langsung mendukung CompactionHook melalui API ini.
 	// Implementasi stub.
