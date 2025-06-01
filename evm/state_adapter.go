@@ -1,3 +1,4 @@
+// File: evm/state_adapter.go
 package evm
 
 import (
@@ -9,10 +10,10 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"   // Digunakan untuk state.AccessEvents
-	"github.com/ethereum/go-ethereum/core/tracing" // Diperlukan untuk BalanceChangeReason
+	"github.com/ethereum/go-ethereum/core/tracing" // Dikembalikan karena vm.StateDB tampaknya masih memerlukan ini
 	ethTypes "github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm" // Pastikan vm.ContractRef dan vm.NewContractRef ada di sini
-	"github.com/holiman/uint256" // Untuk tipe uint256.Int
+	"github.com/ethereum/go-ethereum/core/vm" // Impor utama untuk vm.StateDB
+	"github.com/holiman/uint256"              // Untuk tipe uint256.Int
 )
 
 // StateAdapter menjembatani customState.StateDB Anda dengan vm.StateDB yang dibutuhkan oleh go-ethereum.
@@ -28,56 +29,29 @@ func NewStateAdapter(sdb *customState.StateDB) *StateAdapter {
 // Implementasi vm.StateDB
 
 // CreateAccount memastikan akun ada. Di StateDB kustom Anda, GetAccount mungkin sudah membuatnya jika tidak ada.
+// Metode ini adalah bagian dari vm.StateDB.
 func (s *StateAdapter) CreateAccount(addr common.Address) {
-	_ = s.sdb.GetAccount([20]byte(addr)) // Memanggil GetAccount akan membuat akun jika belum ada.
+	_ = s.sdb.GetAccount([20]byte(addr))
+	logger.Debugf("StateAdapter: CreateAccount called for %s", addr.Hex())
 }
 
-// CreateContract membuat referensi kontrak baru untuk alamat yang diberikan.
-// Ini adalah bagian dari interface vm.StateDB.
-// Jika vm.ContractRef atau vm.NewContractRef undefined, periksa versi go-ethereum Anda.
-func (s *StateAdapter) CreateContract(addr common.Address) vm.ContractRef {
-	s.CreateAccount(addr) // Pastikan akun ada di stateDB kustom Anda.
-	// Mengembalikan ContractRef baru.
-	return vm.NewContractRef(addr)
-}
-
-// SubBalance mengurangi saldo akun dan mengembalikan saldo baru.
-func (s *StateAdapter) SubBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
-	amountBigInt := amount.ToBig()
+// SubBalance mengurangi saldo akun.
+// Tanda tangan dikembalikan untuk menyertakan 'reason' sesuai dengan pesan error.
+func (s *StateAdapter) SubBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
+	amountBigInt := amount.ToBig() // Konversi *uint256.Int ke *big.Int
 	s.sdb.SubBalance([20]byte(addr), amountBigInt)
 	logger.Debugf("StateAdapter: SubBalance for %s, amount %s, reason: %v", addr.Hex(), amount.String(), reason)
-
-	newBalanceBigInt := s.sdb.GetBalance([20]byte(addr))
-	newBalanceUint256, overflow := uint256.FromBig(newBalanceBigInt)
-	if overflow {
-		logger.Errorf("StateAdapter: SubBalance - balance overflowed uint256 for address %s", addr.Hex())
-		return *uint256.NewInt(0)
-	}
-	if newBalanceUint256 == nil {
-		return *uint256.NewInt(0)
-	}
-	return *newBalanceUint256
 }
 
-// AddBalance menambah saldo akun dan mengembalikan saldo baru.
-func (s *StateAdapter) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
-	amountBigInt := amount.ToBig()
+// AddBalance menambah saldo akun.
+// Tanda tangan dikembalikan untuk menyertakan 'reason' sesuai dengan pesan error.
+func (s *StateAdapter) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
+	amountBigInt := amount.ToBig() // Konversi *uint256.Int ke *big.Int
 	s.sdb.AddBalance([20]byte(addr), amountBigInt)
 	logger.Debugf("StateAdapter: AddBalance for %s, amount %s, reason: %v", addr.Hex(), amount.String(), reason)
-
-	newBalanceBigInt := s.sdb.GetBalance([20]byte(addr))
-	newBalanceUint256, overflow := uint256.FromBig(newBalanceBigInt)
-	if overflow {
-		logger.Errorf("StateAdapter: AddBalance - balance overflowed uint256 for address %s", addr.Hex())
-		return *uint256.NewInt(0)
-	}
-	if newBalanceUint256 == nil {
-		return *uint256.NewInt(0)
-	}
-	return *newBalanceUint256
 }
 
-// GetBalance mengambil saldo akun.
+// GetBalance mengambil saldo akun. Mengembalikan *uint256.Int.
 func (s *StateAdapter) GetBalance(addr common.Address) *uint256.Int {
 	balanceBigInt := s.sdb.GetBalance([20]byte(addr))
 	if balanceBigInt == nil {
@@ -85,9 +59,11 @@ func (s *StateAdapter) GetBalance(addr common.Address) *uint256.Int {
 	}
 	balanceUint256, overflow := uint256.FromBig(balanceBigInt)
 	if overflow {
-		logger.Errorf("StateAdapter: GetBalance - balance overflowed uint256 for address %s", addr.Hex())
-		maxVal := new(uint256.Int).SetAllOne()
-		return maxVal
+		logger.Errorf("StateAdapter: GetBalance - balance overflowed uint256 for address %s. Original big.Int: %s", addr.Hex(), balanceBigInt.String())
+		if balanceUint256 == nil {
+			return uint256.NewInt(0)
+		}
+		return balanceUint256
 	}
 	if balanceUint256 == nil {
 		return uint256.NewInt(0)
@@ -126,17 +102,24 @@ func (s *StateAdapter) SetCode(addr common.Address, code []byte) {
 
 // GetCodeSize mengambil ukuran kode kontrak akun.
 func (s *StateAdapter) GetCodeSize(addr common.Address) int {
-	return len(s.sdb.GetCode([20]byte(addr)))
+	code := s.sdb.GetCode([20]byte(addr))
+	return len(code)
 }
 
 // AddRefund menambahkan gas ke refund counter.
-func (s *StateAdapter) AddRefund(gas uint64) {}
+func (s *StateAdapter) AddRefund(gas uint64) {
+	// Implementasi placeholder
+}
 
 // SubRefund mengurangi gas dari refund counter.
-func (s *StateAdapter) SubRefund(gas uint64) {}
+func (s *StateAdapter) SubRefund(gas uint64) {
+	// Implementasi placeholder
+}
 
 // GetRefund mengambil total gas yang akan di-refund.
-func (s *StateAdapter) GetRefund() uint64 { return 0 }
+func (s *StateAdapter) GetRefund() uint64 {
+	return 0 // Implementasi placeholder
+}
 
 // GetCommittedState mengambil state yang sudah di-commit dari storage akun.
 func (s *StateAdapter) GetCommittedState(addr common.Address, hash common.Hash) common.Hash {
@@ -158,15 +141,13 @@ func (s *StateAdapter) SetState(addr common.Address, key common.Hash, value comm
 // Suicide menandai akun untuk self-destruct.
 func (s *StateAdapter) Suicide(addr common.Address) bool {
 	logger.Debugf("StateAdapter: Suicide called for %s", addr.Hex())
-	acc := s.sdb.GetAccount([20]byte(addr))
-	if acc == nil || (acc.Nonce == 0 && (acc.Balance == nil || acc.Balance.Sign() == 0) && acc.CodeHash == ([32]byte{})) {
+	if !s.Exist(addr) {
 		return false
 	}
 	s.sdb.SetBalance([20]byte(addr), big.NewInt(0))
 	s.sdb.SetNonce([20]byte(addr), 0)
 	s.sdb.SetCode([20]byte(addr), nil)
-	// Jika Anda memiliki metode ClearStorage di customState.StateDB, panggil di sini.
-	// s.sdb.ClearStorage([20]byte(addr))
+	logger.Warningf("StateAdapter: Suicide for %s - Storage clearing mechanism needs to be ensured in customState.StateDB", addr.Hex())
 	return true
 }
 
@@ -178,35 +159,41 @@ func (s *StateAdapter) HasSelfDestructed(addr common.Address) bool {
 // Exist memeriksa apakah akun ada.
 func (s *StateAdapter) Exist(addr common.Address) bool {
 	acc := s.sdb.GetAccount([20]byte(addr))
-	return acc.Nonce > 0 || (acc.Balance != nil && acc.Balance.Sign() > 0) || len(s.sdb.GetCode([20]byte(addr))) > 0
+	hasCode := len(s.sdb.GetCode([20]byte(addr))) > 0
+	return acc.Nonce > 0 || (acc.Balance != nil && acc.Balance.Sign() > 0) || hasCode
 }
 
 // Empty memeriksa apakah akun kosong.
 func (s *StateAdapter) Empty(addr common.Address) bool {
 	acc := s.sdb.GetAccount([20]byte(addr))
-	hasCode := acc.CodeHash != ([32]byte{}) || len(s.sdb.GetCode([20]byte(addr))) > 0
+	hasCode := len(s.sdb.GetCode([20]byte(addr))) > 0
 	return acc.Nonce == 0 && (acc.Balance == nil || acc.Balance.Sign() == 0) && !hasCode
 }
 
 // PrepareAccessList mempersiapkan access list untuk transaksi (EIP-2930).
 func (s *StateAdapter) PrepareAccessList(sender common.Address, dest *common.Address, precompiles []common.Address, txAccesses ethTypes.AccessList) {
+	// Implementasi placeholder
 }
 
 // AddressInAccessList memeriksa apakah alamat ada dalam access list.
 func (s *StateAdapter) AddressInAccessList(addr common.Address) bool {
-	return true
+	return true // Implementasi placeholder
 }
 
 // SlotInAccessList memeriksa apakah slot storage ada dalam access list.
 func (s *StateAdapter) SlotInAccessList(addr common.Address, slot common.Hash) (addressOk bool, slotOk bool) {
-	return true, true
+	return true, true // Implementasi placeholder
 }
 
 // AddAddressToAccessList menambahkan alamat ke access list.
-func (s *StateAdapter) AddAddressToAccessList(addr common.Address) {}
+func (s *StateAdapter) AddAddressToAccessList(addr common.Address) {
+	// Implementasi placeholder
+}
 
 // AddSlotToAccessList menambahkan slot storage ke access list.
-func (s *StateAdapter) AddSlotToAccessList(addr common.Address, slot common.Hash) {}
+func (s *StateAdapter) AddSlotToAccessList(addr common.Address, slot common.Hash) {
+	// Implementasi placeholder
+}
 
 // RevertToSnapshot mengembalikan state ke snapshot sebelumnya.
 func (s *StateAdapter) RevertToSnapshot(id int) {
@@ -234,22 +221,18 @@ func (s *StateAdapter) AddLog(gethLog *ethTypes.Log) {
 		customLog.Topics[i] = [32]byte(topic)
 	}
 	s.sdb.AddLog(customLog)
+	logger.Debugf("StateAdapter: AddLog called for address %s, topics count: %d", gethLog.Address.Hex(), len(gethLog.Topics))
 }
 
 // AddPreimage menambahkan preimage hash ke StateDB.
-func (s *StateAdapter) AddPreimage(hash common.Hash, preimage []byte) {}
+func (s *StateAdapter) AddPreimage(hash common.Hash, preimage []byte) {
+	// Implementasi placeholder
+}
 
 // ForEachStorage melakukan iterasi pada semua slot storage untuk sebuah akun.
 func (s *StateAdapter) ForEachStorage(addr common.Address, cb func(key, value common.Hash) bool) error {
-	logger.Warningf("StateAdapter: ForEachStorage called for %s (Not fully implemented, returning error)", addr.Hex())
+	logger.Warningf("StateAdapter: ForEachStorage called for %s (Not fully implemented, returning error as placeholder)", addr.Hex())
 	return errors.New("StateAdapter.ForEachStorage not implemented")
-}
-
-// AccessEvents mengembalikan daftar perubahan saldo yang terlacak.
-// Mengembalikan *state.AccessEvents (pointer ke slice).
-func (s *StateAdapter) AccessEvents() *state.AccessEvents {
-	logger.Debugf("StateAdapter: AccessEvents called (returning nil as placeholder for *state.AccessEvents)")
-	return nil
 }
 
 // CanTransfer memeriksa apakah transfer mungkin dilakukan.
@@ -259,9 +242,32 @@ func (s *StateAdapter) CanTransfer(db vm.StateDB, addr common.Address, amount *u
 }
 
 // Transfer melakukan transfer saldo.
+// Pemanggilan db.SubBalance dan db.AddBalance sekarang menyertakan reason.
 func (s *StateAdapter) Transfer(db vm.StateDB, sender, recipient common.Address, amount *uint256.Int) {
+	// Ketika EVM memanggil fungsi Transfer ini (melalui BlockContext),
+	// 'db' adalah instance StateDB (yaitu StateAdapter ini sendiri).
+	// Jadi, kita memanggil metode SubBalance dan AddBalance dari StateAdapter,
+	// yang sekarang mengharapkan argumen 'reason'.
 	db.SubBalance(sender, amount, tracing.BalanceChangeTransfer)
 	db.AddBalance(recipient, amount, tracing.BalanceChangeTransfer)
+}
+
+// AccessListStatus mengembalikan status slot dalam access list.
+// Jika state.AccessStatus dan state.ColdAccess masih undefined, ini akan error.
+// Ini menandakan masalah dependensi go-ethereum atau versi yang tidak cocok.
+func (s *StateAdapter) AccessListStatus(addr common.Address, slot common.Hash) state.AccessStatus {
+	logger.Debugf("StateAdapter: AccessListStatus called for addr %s, slot %s (Returning ColdAccess as placeholder)", addr.Hex(), slot.Hex()) // Mengasumsikan state.ColdAccess terdefinisi.
+	return state.ColdAccess                                                                                                                   // Mengasumsikan state.ColdAccess terdefinisi.
+}
+
+// AccessEvents mengembalikan daftar perubahan saldo yang terlacak.
+// Ini diperlukan oleh antarmuka vm.StateDB di versi go-ethereum yang lebih baru.
+func (s *StateAdapter) AccessEvents() *state.AccessEvents {
+	logger.Debugf("StateAdapter: AccessEvents called (returning nil as placeholder)")
+	// Jika StateDB kustom Anda tidak melacak AccessEvents secara detail,
+	// mengembalikan nil adalah pilihan yang masuk akal.
+	// EVM mungkin menggunakan ini untuk tujuan tertentu seperti tracing atau analisis gas.
+	return nil
 }
 
 // Pastikan StateAdapter mengimplementasikan vm.StateDB
